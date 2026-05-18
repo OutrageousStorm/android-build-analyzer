@@ -1,73 +1,107 @@
 #!/usr/bin/env python3
 """
-analyze.py -- Analyze Android Gradle build profiles
-Requires: ./gradlew build --profile (generates build/reports/profile/profile-<timestamp>.html)
-Usage: python3 analyze.py [profile.html] [--top 20]
+analyze.py -- Gradle build log analyzer
+Parses Gradle output and identifies bottlenecks, slow tasks, and optimization opportunities
+Usage: python3 analyze.py build.log [--json] [--top N]
 """
-import sys, re, json, argparse
-from pathlib import Path
+import re, sys, json, argparse
+from collections import defaultdict
+from datetime import datetime
 
-def find_profile():
-    """Find latest profile report"""
-    p = Path("build/reports/profile")
-    if not p.exists(): return None
-    profiles = sorted(p.glob("profile-*.html"), key=lambda x: x.stat().st_mtime, reverse=True)
-    return profiles[0] if profiles else None
-
-def parse_html_profile(html_file):
-    """Extract task timing from Gradle profile HTML"""
-    with open(html_file) as f:
-        content = f.read()
+class GradleAnalyzer:
+    def __init__(self, logfile):
+        self.logfile = logfile
+        self.tasks = []
+        self.total_time = 0
+        self.warnings = []
+        
+    def parse(self):
+        with open(self.logfile) as f:
+            content = f.read()
+        
+        # Extract task execution times
+        # Pattern: ":app:compileDebugKotlin 4.5s"
+        pattern = r':[\w:]+\s+([\d.]+)s'
+        for match in re.finditer(pattern, content):
+            time_str = match.group(1)
+            try:
+                seconds = float(time_str)
+                task_name = match.group(0).split()[0]
+                self.tasks.append({
+                    'name': task_name,
+                    'time': seconds,
+                    'percentage': 0
+                })
+            except ValueError:
+                pass
+        
+        # Extract total build time
+        total_match = re.search(r'BUILD SUCCESSFUL.*?(\d+[ms\.]+)', content)
+        if total_match:
+            time_str = total_match.group(1)
+            self.total_time = self._parse_time(time_str)
+        
+        # Look for warnings
+        if 'warning' in content.lower():
+            self.warnings = re.findall(r'warning:(.+)', content, re.IGNORECASE)
+        
+        # Calculate percentages
+        total = sum(t['time'] for t in self.tasks)
+        for task in self.tasks:
+            task['percentage'] = round((task['time'] / total * 100), 1) if total else 0
+        
+        # Sort by time
+        self.tasks.sort(key=lambda x: x['time'], reverse=True)
     
-    tasks = []
-    # Look for task rows: <td>task_name</td> <td>duration_ms</td>
-    pattern = r'<td[^>]*>([^<]+)</td>\s*<td[^>]*>(\d+)ms</td>'
-    for match in re.finditer(pattern, content):
-        task = match.group(1).strip()
-        duration = int(match.group(2))
-        tasks.append((task, duration))
+    def _parse_time(self, s):
+        s = s.lower()
+        if 'm' in s: return int(s.split('m')[0]) * 60
+        if 's' in s: return float(s.split('s')[0])
+        return 0
     
-    return sorted(tasks, key=lambda x: x[1], reverse=True)
+    def print_report(self, top=10):
+        print('\n📊 Gradle Build Analysis')
+        print('─' * 60)
+        print(f'Total build time: {self.total_time:.1f}s')
+        print(f'Total tasks: {len(self.tasks)}')
+        if self.warnings:
+            print(f'Warnings: {len(self.warnings)}')
+        
+        print(f'\nTop {min(top, len(self.tasks))} slowest tasks:')
+        for i, task in enumerate(self.tasks[:top]):
+            bar = '█' * int(task['percentage'] / 5) + '░' * (20 - int(task['percentage'] / 5))
+            print(f"  {bar} {task['name']:<40} {task['time']:6.2f}s ({task['percentage']:5.1f}%)")
+        
+        if self.warnings:
+            print(f'\nWarnings:')
+            for w in self.warnings[:5]:
+                print(f"  ⚠️  {w[:80]}")
+    
+    def to_json(self):
+        return json.dumps({
+            'total_time': self.total_time,
+            'task_count': len(self.tasks),
+            'top_tasks': self.tasks[:10],
+            'warnings': len(self.warnings)
+        }, indent=2)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("profile", nargs='?', help="Path to profile HTML")
-    parser.add_argument("--top", type=int, default=20)
-    parser.add_argument("--json", action="store_true", help="Output JSON")
+    parser.add_argument('logfile', help='Gradle build log file')
+    parser.add_argument('--json', action='store_true', help='Output as JSON')
+    parser.add_argument('--top', type=int, default=10, help='Show top N tasks')
     args = parser.parse_args()
-
-    profile_path = args.profile and Path(args.profile) or find_profile()
-    if not profile_path or not profile_path.exists():
-        print("❌ No profile found. Run: ./gradlew build --profile")
+    
+    try:
+        analyzer = GradleAnalyzer(args.logfile)
+        analyzer.parse()
+        if args.json:
+            print(analyzer.to_json())
+        else:
+            analyzer.print_report(args.top)
+    except FileNotFoundError:
+        print(f'File not found: {args.logfile}')
         sys.exit(1)
 
-    print(f"📊 Analyzing: {profile_path.name}\n")
-    tasks = parse_html_profile(str(profile_path))
-    
-    if not tasks:
-        print("⚠️  No tasks found in profile.")
-        return
-
-    total_ms = sum(t[1] for t in tasks)
-    print(f"Total build time: {total_ms/1000:.1f}s\n")
-    print(f"{'Rank':<5} {'Task':<50} {'Time':<10} {'%'}")
-    print("─" * 75)
-
-    for i, (task, duration) in enumerate(tasks[:args.top], 1):
-        pct = (duration / total_ms * 100) if total_ms else 0
-        bar = "▓" * int(pct / 2)
-        print(f"{i:<5} {task[:49]:<50} {duration/1000:>6.2f}s {bar}")
-
-    slow_threshold = total_ms * 0.1  # Tasks taking >10% of total time
-    slow = [t for t in tasks if t[1] > slow_threshold]
-    if slow:
-        print(f"\n⚠️  {len(slow)} tasks take >10% of build time:")
-        for task, duration in slow:
-            print(f"  • {task} ({duration/1000:.2f}s)")
-
-    if args.json:
-        out = {"total_ms": total_ms, "tasks": [{"name": t[0], "duration_ms": t[1]} for t in tasks]}
-        print(json.dumps(out, indent=2))
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
